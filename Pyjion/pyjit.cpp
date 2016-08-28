@@ -29,10 +29,132 @@
 #include "pycomp.h"
 
 #include <vector>
+#include <unordered_map>
 //#define NO_TRACE
 //#define TRACE_TREE
 
 HINSTANCE            g_pMSCorEE;
+PyObject* g_weakCallback;
+
+class WeakDict {
+	struct WeakInfo {
+		PyObject* value;
+		PyObject* weakref;
+		
+		WeakInfo() {
+		}
+
+		WeakInfo(PyObject* value, PyObject* weakref) : value(value), weakref(weakref) {
+		}
+	};
+
+	unordered_map<PyObject*, WeakInfo> m_map;
+	unordered_map<PyObject*, PyObject*> m_weakRefToCode;
+
+public:
+	WeakDict() {
+	}
+
+	void free(PyObject* weakref) {
+		auto code = m_weakRefToCode[weakref];
+		m_weakRefToCode.erase(weakref);
+		m_map.erase(code);
+	}
+
+	bool add(PyObject* key, PyObject* value) {
+		_ASSERTE(try_get(key) == nullptr);
+		
+		auto weakref = PyWeakref_NewRef(key, g_weakCallback);
+		if (weakref == nullptr) {
+			// OOM!
+			return false;
+		}
+		m_weakRefToCode[weakref] = key;
+
+		m_map[key] = WeakInfo(value, weakref);
+		return true;
+	}
+
+	PyObject* try_get(PyObject* key) {
+		auto res = m_map.find(key);
+		if (res == m_map.end()) {
+			return nullptr;
+		}
+		return res->second.value;
+	}
+};
+
+WeakDict g_weakCodeMap;
+
+PyObject * weakref_callback(PyObject *self, PyObject *args, PyObject *kwargs) {
+	WeakrefCallback* callback = (WeakrefCallback*)self;
+	auto weakref = ((PyTupleObject*)args)->ob_item[0];
+	g_weakCodeMap.free(weakref);
+	auto res = Py_None;
+	Py_IncRef(res);
+	return res;
+}
+
+PyTypeObject PyjionWeakRefCallback = {
+	PyVarObject_HEAD_INIT(&PyType_Type, 0)
+	"pyjionweakrefcallback",			/* tp_name */
+	sizeof(WeakrefCallback),			/* tp_basicsize */
+	0,                                  /* tp_itemsize */
+	0,									/* tp_dealloc */
+	0,                                  /* tp_print */
+	0,                                  /* tp_getattr */
+	0,                                  /* tp_setattr */
+	0,                                  /* tp_reserved */
+	0,                                  /* tp_repr */
+	0,                                  /* tp_as_number */
+	0,                                  /* tp_as_sequence */
+	0,                                  /* tp_as_mapping */
+	0,                                  /* tp_hash */
+	weakref_callback,                   /* tp_call */
+	0,                                  /* tp_str */
+	0,                                  /* tp_getattro */
+	0,                                  /* tp_setattro */
+	0,                                  /* tp_as_buffer */
+	Py_TPFLAGS_DEFAULT,                 /* tp_flags */
+	0,                                  /* tp_doc */
+	0,                                  /* tp_traverse */
+	0,                                  /* tp_clear */
+	0,                                  /* tp_richcompare */
+	0,                                  /* tp_weaklistoffset */
+	0,                                  /* tp_iter */
+	0,                                  /* tp_iternext */
+	0,                                  /* tp_methods */
+	0,                                  /* tp_members */
+	0,                                  /* tp_getset */
+	0,                                  /* tp_base */
+	0,                                  /* tp_dict */
+	0,                                  /* tp_descr_get */
+	0,                                  /* tp_descr_set */
+	0,                                  /* tp_dictoffset */
+	0,                                  /* tp_init */
+	0,                                  /* tp_alloc */
+	0,									/* tp_new */
+};
+
+//#define USE_CODE_EXTRA
+
+PyObject* PyJit_GetCodeExtra(PyCodeObject* obj) {
+#ifdef USE_CODE_EXTRA
+	return obj->co_extra;
+#else
+	return g_weakCodeMap.try_get((PyObject*)obj);
+#endif
+}
+
+
+bool PyJit_SetCodeExtra(PyCodeObject* obj, PyObject* value) {
+#ifdef USE_CODE_EXTRA
+	obj->co_extra = value;
+	return true;
+#else
+	return g_weakCodeMap.add((PyObject*)obj, value);
+#endif
+}
 
 PyObject* Jit_EvalHelper(void* state, PyFrameObject*frame) {
     PyThreadState *tstate = PyThreadState_GET();
@@ -59,6 +181,8 @@ extern "C" __declspec(dllexport) void JitInit() {
     g_jit = getJit();
 
     g_emptyTuple = PyTuple_New(0);
+
+	g_weakCallback = PyObject_New(PyObject, &PyjionWeakRefCallback);
 }
 
 __declspec(dllexport) PyjionJittedCode *jittedcode_new_direct() {
@@ -95,7 +219,7 @@ __declspec(dllexport) bool jit_compile(PyCodeObject* code) {
         return false;
     }
 
-    auto jittedCode = (PyjionJittedCode *)code->co_extra;
+    auto jittedCode = (PyjionJittedCode *)PyJit_GetCodeExtra(code);
 
 #ifdef DEBUG_TRACE
     static int compileCount = 0, failCount = 0;
@@ -294,7 +418,7 @@ PyObject* Jit_EvalTrace(void* state, PyFrameObject *frame) {
     }
 
     // No specialized function yet, let's see if we should create one...
-    auto jittedCode = (PyjionJittedCode *)trace->code->co_extra;
+    auto jittedCode = (PyjionJittedCode *)PyJit_GetCodeExtra(trace->code);
     if (curNode->hitCount > jittedCode->j_specialization_threshold) {
         // Compile and run the now compiled code...
         PythonCompiler jitter(trace->code);
@@ -336,7 +460,7 @@ PyObject* Jit_EvalTrace(void* state, PyFrameObject *frame) {
         curNode->jittedCode = res;
         if (!isSpecialized) {
             trace->Generic = curNode->addr;
-            PyjionJittedCode* pyjionCode = (PyjionJittedCode*)frame->f_code->co_extra;
+            PyjionJittedCode* pyjionCode = (PyjionJittedCode*)PyJit_GetCodeExtra(frame->f_code);
             pyjionCode->j_evalfunc = Jit_EvalGeneric;
         }
 
@@ -419,7 +543,7 @@ PyObject* Jit_EvalTrace(void* state, PyFrameObject *frame) {
                     // We didn't produce a specialized function, force all code down
                     // the generic code path.
                     trace->Generic = opt->addr;
-                    PyjionJittedCode* pyjionCode = (PyjionJittedCode*)frame->f_code->co_extra;
+                    PyjionJittedCode* pyjionCode = (PyjionJittedCode*)PyJit_GetCodeExtra(frame->f_code);
                     pyjionCode->j_evalfunc = Jit_EvalGeneric;
                 }
 
@@ -466,10 +590,9 @@ __declspec(dllexport) bool jit_compile(PyCodeObject* code) {
         return false;
     }
 
-    auto res = (PyjionJittedCode *)code->co_extra;
+    auto res = (PyjionJittedCode *)PyJit_GetCodeExtra(code);
     res->j_evalfunc = &Jit_EvalTrace;
     res->j_evalstate = trace;
-    code->co_extra = (PyObject *)res;
     return true;
 }
 
@@ -478,17 +601,17 @@ __declspec(dllexport) bool jit_compile(PyCodeObject* code) {
 static PY_UINT64_T HOT_CODE = 20000;
 
 extern "C" __declspec(dllexport) PyObject *EvalFrame(PyFrameObject *f, int throwflag) {
-    if (f->f_code->co_extra == nullptr) {
+    if (PyJit_GetCodeExtra(f->f_code) == nullptr) {
         auto jitted = jittedcode_new_direct();
         if (jitted == nullptr) {
             return NULL;
         }
 
-        f->f_code->co_extra = (PyObject *)jitted;
+		PyJit_SetCodeExtra(f->f_code, (PyObject *)jitted);
         jitted->j_run_count++;
     }
     else if (!throwflag) {
-        auto jitted = (PyjionJittedCode *)f->f_code->co_extra;
+        auto jitted = (PyjionJittedCode *)PyJit_GetCodeExtra(f->f_code);
         if (Py_TYPE(jitted) == &PyjionJittedCode_Type && !jitted->j_failed) {
             if (jitted->j_evalfunc != nullptr) {
                 return jitted->j_evalfunc(jitted->j_evalstate, f);

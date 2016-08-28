@@ -65,6 +65,12 @@ typedef struct {
     PY_UINT64_T j_specialization_threshold;
 } PyjionJittedCode;
 
+class WeakDict;
+
+typedef struct {
+	PyObject_HEAD
+} WeakrefCallback;
+
 __declspec(dllexport) PyjionJittedCode *jittedcode_new_direct();
 __declspec(dllexport) bool jit_compile(PyCodeObject* code);
 
